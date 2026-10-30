@@ -1,11 +1,13 @@
 package com.deroyqueit.productactivation.controller;
 
 import com.deroyqueit.productactivation.IntegrationTest;
+import com.jayway.jsonpath.JsonPath;
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jwt.JwsHeader;
 import org.springframework.security.oauth2.jwt.JwtClaimsSet;
@@ -20,6 +22,7 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @IntegrationTest
@@ -65,6 +68,25 @@ class JwtValidationTests {
 
         mockMvc.perform(get(REQUESTS_URL).header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void readTokenFromDevEndpointReadsButCannotCreate() throws Exception {
+        String token = devToken("READ");
+
+        mockMvc.perform(get(REQUESTS_URL).header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+                .andExpect(status().isOk());
+        mockMvc.perform(post(REQUESTS_URL).header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"externalId\":\"EXT-1\",\"customerId\":\"CUST-1\",\"productCode\":\"INTERNET-500\"}"))
+                .andExpect(status().isForbidden());
+    }
+
+    private String devToken(String scope) throws Exception {
+        String response = mockMvc.perform(post("/dev/token").param("scope", scope))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        return JsonPath.read(response, "$.accessToken");
     }
 
     private static JwtClaimsSet claims(String audience, Instant expiresAt) {

@@ -36,6 +36,7 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers("/actuator/health/**", "/actuator/info").permitAll()
                         .requestMatchers("/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs/**").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/dev/token").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/v1/requests").hasAuthority(WRITE_SCOPE)
                         .requestMatchers(HttpMethod.GET, "/api/v1/requests", "/api/v1/requests/**").hasAuthority(READ_SCOPE)
                         .anyRequest().denyAll())
