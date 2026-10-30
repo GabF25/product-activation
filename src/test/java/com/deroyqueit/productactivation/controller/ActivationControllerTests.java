@@ -78,6 +78,16 @@ class ActivationControllerTests {
     }
 
     @Test
+    void bodyAboveSizeLimitIsRejected() throws Exception {
+        mockMvc.perform(post(REQUESTS_URL).with(writer())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"externalId\": \"" + "A".repeat(2000) + "\"}"))
+                .andExpect(status().isPayloadTooLarge())
+                .andExpect(content().contentType(MediaType.APPLICATION_PROBLEM_JSON))
+                .andExpect(jsonPath("$.traceId").isNotEmpty());
+    }
+
+    @Test
     void retryWithSameContentReplaysOriginalResponse() throws Exception {
         String firstResponse = createActivationResponse(CLIENT, "EXT-1", "CUST-1", "INTERNET-500");
         String firstId = JsonPath.read(firstResponse, "$.id");
