@@ -29,8 +29,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 
 @IntegrationTest
 class ActivationProcessingServiceTests {
@@ -72,7 +75,7 @@ class ActivationProcessingServiceTests {
         UUID id = createActivation();
         given(providerClient.activate(any())).willReturn(new Success());
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.COMPLETED);
         assertThat(attemptsOf(id))
@@ -88,7 +91,7 @@ class ActivationProcessingServiceTests {
         UUID id = createActivation();
         given(providerClient.activate(any())).willReturn(new PermanentFailure("Provider responded HTTP 400"));
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.FAILED);
         assertThat(attemptsOf(id))
@@ -103,7 +106,7 @@ class ActivationProcessingServiceTests {
         given(providerClient.activate(any())).willReturn(new RetryableFailure("Provider responded HTTP 500", null));
         Instant before = Instant.now();
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         Activation activation = activationService.findById(CLIENT, id);
         assertThat(activation.status()).isEqualTo(ActivationStatus.PENDING);
@@ -121,7 +124,7 @@ class ActivationProcessingServiceTests {
         UUID id = createActivation();
         given(providerClient.activate(any())).willReturn(new RetryableFailure("Provider responded HTTP 429", Duration.ofDays(1)));
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).nextAttemptAt())
                 .isBeforeOrEqualTo(Instant.now().plus(properties.maxBackoff()));
@@ -132,8 +135,8 @@ class ActivationProcessingServiceTests {
         UUID id = createActivation();
         given(providerClient.activate(any())).willReturn(new RetryableFailure("Provider unreachable", Duration.ZERO));
 
-        processingService.processPendingActivations();
-        processingService.processPendingActivations();
+        processAndAwait();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.FAILED);
         assertThat(attemptsOf(id))
@@ -150,10 +153,35 @@ class ActivationProcessingServiceTests {
             return allCallsStarted.await(5, TimeUnit.SECONDS) ? new Success() : new PermanentFailure("Calls ran one by one");
         });
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         ids.forEach(id ->
                 assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.COMPLETED));
+    }
+
+    @Test
+    void slowActivationDoesNotHoldTheNextCycle() {
+        UUID slow = createActivation();
+        CountDownLatch releaseSlow = new CountDownLatch(1);
+        given(providerClient.activate(any())).willAnswer(invocation -> {
+            Activation activation = invocation.getArgument(0);
+            if (activation.id().equals(slow)) {
+                releaseSlow.await(5, TimeUnit.SECONDS);
+            }
+            return new Success();
+        });
+        processingService.processPendingActivations();
+
+        UUID fast = createActivation();
+        processingService.processPendingActivations();
+
+        await().untilAsserted(() ->
+                assertThat(activationService.findById(CLIENT, fast).status()).isEqualTo(ActivationStatus.COMPLETED));
+        assertThat(activationService.findById(CLIENT, slow).status()).isEqualTo(ActivationStatus.PROCESSING);
+
+        releaseSlow.countDown();
+        await().untilAsserted(() ->
+                assertThat(activationService.findById(CLIENT, slow).status()).isEqualTo(ActivationStatus.COMPLETED));
     }
 
     @Test
@@ -162,6 +190,7 @@ class ActivationProcessingServiceTests {
         given(providerClient.activate(any())).willThrow(new IllegalStateException("simulated crash"));
 
         processingService.processPendingActivations();
+        verify(providerClient, timeout(5000)).activate(any());
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.PROCESSING);
         assertThat(attemptsOf(id)).isEmpty();
 
@@ -195,6 +224,12 @@ class ActivationProcessingServiceTests {
                     .hasSize(1)
                     .doesNotContain(lockedByFirst.getFirst().getId());
         });
+    }
+
+    private void processAndAwait() {
+        processingService.processPendingActivations();
+        await().until(() -> jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM activation WHERE status = 'PROCESSING'", Long.class) == 0);
     }
 
     private UUID createActivation() {

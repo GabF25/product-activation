@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.IOException;
@@ -20,6 +21,7 @@ import java.time.Duration;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 @IntegrationTest
 class ActivationProviderFlowTests {
@@ -42,6 +44,9 @@ class ActivationProviderFlowTests {
 
     @Autowired
     private TransactionTemplate transactionTemplate;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     private HttpServer provider;
     private ActivationProcessingService processingService;
@@ -71,7 +76,7 @@ class ActivationProviderFlowTests {
         UUID id = createActivation();
         providerResponds(200, Duration.ZERO);
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.COMPLETED);
     }
@@ -81,7 +86,7 @@ class ActivationProviderFlowTests {
         UUID id = createActivation();
         providerResponds(400, Duration.ZERO);
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.FAILED);
         assertThat(lastError(id)).isEqualTo("Provider responded HTTP 400");
@@ -92,7 +97,7 @@ class ActivationProviderFlowTests {
         UUID id = createActivation();
         providerResponds(500, Duration.ZERO);
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.PENDING);
         assertThat(lastError(id)).isEqualTo("Provider responded HTTP 500");
@@ -103,10 +108,16 @@ class ActivationProviderFlowTests {
         UUID id = createActivation();
         providerResponds(200, READ_TIMEOUT.multipliedBy(3));
 
-        processingService.processPendingActivations();
+        processAndAwait();
 
         assertThat(activationService.findById(CLIENT, id).status()).isEqualTo(ActivationStatus.PENDING);
         assertThat(lastError(id)).isEqualTo("Provider unreachable or timed out");
+    }
+
+    private void processAndAwait() {
+        processingService.processPendingActivations();
+        await().until(() -> jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM activation WHERE status = 'PROCESSING'", Long.class) == 0);
     }
 
     private UUID createActivation() {

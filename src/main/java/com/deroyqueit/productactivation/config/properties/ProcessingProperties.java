@@ -7,6 +7,7 @@ import java.time.Duration;
 @ConfigurationProperties("activation.processing")
 public record ProcessingProperties(
         int batchSize,
+        int maxConcurrency,
         int maxAttempts,
         Duration initialBackoff,
         Duration maxBackoff,

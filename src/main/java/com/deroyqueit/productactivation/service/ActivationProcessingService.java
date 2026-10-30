@@ -13,6 +13,7 @@ import com.deroyqueit.productactivation.mapper.ActivationAttemptMapper;
 import com.deroyqueit.productactivation.mapper.ActivationMapper;
 import com.deroyqueit.productactivation.repository.ActivationAttemptRepository;
 import com.deroyqueit.productactivation.repository.ActivationRepository;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -25,6 +26,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadLocalRandom;
 
 @Service
@@ -38,6 +40,8 @@ public class ActivationProcessingService {
     private final ActivationProviderClient providerClient;
     private final ProcessingProperties properties;
     private final TransactionTemplate transactionTemplate;
+    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final Semaphore slots;
 
     public ActivationProcessingService(ActivationRepository repository,
                                        ActivationAttemptRepository attemptRepository,
@@ -49,13 +53,24 @@ public class ActivationProcessingService {
         this.providerClient = providerClient;
         this.properties = properties;
         this.transactionTemplate = transactionTemplate;
+        this.slots = new Semaphore(properties.maxConcurrency());
     }
 
     public void processPendingActivations() {
-        List<Activation> claimed = claimPendingActivations();
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            claimed.forEach(activation -> executor.submit(() -> activateSafely(activation)));
+        int free = slots.availablePermits();
+        if (free == 0) {
+            return;
         }
+        claimPendingActivations(free).forEach(activation -> {
+            slots.acquireUninterruptibly();
+            executor.submit(() -> {
+                try {
+                    activateSafely(activation);
+                } finally {
+                    slots.release();
+                }
+            });
+        });
     }
 
     public void recoverStuckActivations() {
@@ -68,9 +83,14 @@ public class ActivationProcessingService {
         });
     }
 
-    private List<Activation> claimPendingActivations() {
+    @PreDestroy
+    void shutdown() {
+        executor.close();
+    }
+
+    private List<Activation> claimPendingActivations(int limit) {
         return transactionTemplate.execute(transaction ->
-                repository.claimPendingDueBy(Instant.now(), properties.batchSize()).stream()
+                repository.claimPendingDueBy(Instant.now(), limit).stream()
                         .map(ActivationMapper::toDomain)
                         .toList());
     }
