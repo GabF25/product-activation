@@ -8,6 +8,8 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -27,4 +29,27 @@ public interface ActivationRepository extends JpaRepository<ActivationEntity, UU
                                   @Param("status") ActivationStatus status,
                                   @Param("customerId") String customerId,
                                   Pageable pageable);
+
+    @Query(value = """
+            UPDATE activation
+            SET status = 'PROCESSING', next_attempt_at = NULL, updated_at = :now, version = version + 1
+            WHERE id IN (
+                SELECT id FROM activation
+                WHERE status = 'PENDING' AND next_attempt_at <= :now
+                ORDER BY next_attempt_at
+                LIMIT :limit
+                FOR UPDATE SKIP LOCKED)
+            RETURNING *
+            """, nativeQuery = true)
+    List<ActivationEntity> claimPendingDueBy(@Param("now") Instant now, @Param("limit") int limit);
+
+    @Query(value = """
+            SELECT * FROM activation
+            WHERE status = 'PROCESSING' AND updated_at < :threshold
+            ORDER BY updated_at
+            LIMIT :limit
+            FOR UPDATE SKIP LOCKED
+            """, nativeQuery = true)
+    List<ActivationEntity> lockProcessingStartedBefore(@Param("threshold") Instant threshold,
+                                                       @Param("limit") int limit);
 }
