@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: 'postgres:17'
+    environment:
+      - 'POSTGRES_DB=product-activation'
+      - 'POSTGRES_PASSWORD=pass'
+      - 'POSTGRES_USER=user'
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U user -d product-activation']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  provider-mock:
+    image: 'wiremock/wiremock:3.13.1'
+    ports:
+      - '8089:8080'
+    volumes:
+      - ./provider-mock:/home/wiremock
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      provider-mock:
+        condition: service_started
+    environment:
+      - 'SPRING_PROFILES_ACTIVE=local'
+      - 'DB_URL=jdbc:postgresql://postgres:5432/product-activation'
+      - 'DB_USERNAME=user'
+      - 'DB_PASSWORD=pass'
+      - 'PROVIDER_BASE_URL=http://provider-mock:8080'
+    ports:
+      - '28080:28080'
+    stop_grace_period: 30s
+
+volumes:
+  pgdata:
