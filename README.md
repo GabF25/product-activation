@@ -226,3 +226,71 @@ O token HMAC do `dev-token.sh` só funciona no perfil local.
 Unitários para domínio, mapper e cliente HTTP (contra um servidor HTTP local). Integração com PostgreSQL real via
 Testcontainers para duplicidade, concorrência e processamento, porque o H2 não se comporta igual. E um teste de ponta
 a ponta do provedor: sucesso, 400, 500 e timeout.
+
+## 🔎 Cenário de análise
+
+1. **Primeiro:** o que mudou quando a lentidão começou (deploy, tráfego, provedor) e os percentis p95/p99. CPU e
+   memória estão baixas, então a aplicação está esperando algo.
+2. **Onde está o problema:** quebrando o tempo de uma requisição lenta entre banco, provedor e espera. Se banco e
+   provedor não explicam tudo, sobra fila de conexão ou de thread.
+3. **Métricas:**
+   - **Latência por endpoint (p95/p99):** mostra se todas as rotas ficaram lentas ou só algumas.
+   - **Pool do Hikari:** quantas conexões estão em uso e quantas requisições estão esperando uma conexão livre. Se
+     tem gente esperando, alguém está segurando conexão por muito tempo.
+   - **Threads do Tomcat:** quantas estão ocupadas. Se chegam no limite, as requisições novas ficam na fila.
+   - **`pg_stat_statements`:** quais queries consomem mais tempo no total e se alguma ficou mais lenta.
+   - **`pg_stat_activity`:** o que cada conexão está fazendo agora. Muitas em `idle in transaction` quer dizer
+     transação aberta, esperando a aplicação.
+   - **Latência do provedor:** tempo e taxa de erro das chamadas externas.
+   - **Logs com o id de correlação:** para seguir uma requisição lenta do começo ao fim.
+4. **Melhorias:** chamar o provedor fora da requisição e da transação, timeouts e revisar as queries que pioraram.
+5. **Causa comum:** sim, é bem possível. Se a chamada ao provedor acontece dentro de uma transação, a conexão com o
+   banco fica presa durante os 3 s da chamada. Com várias requisições assim, o pool acaba e as outras ficam esperando
+   uma conexão livre, até as que não usam o provedor. Por isso parece que as queries ficaram lentas. Para confirmar,
+   eu veria se as requisições esperando conexão no Hikari aumentam junto com a latência do provedor e se aparecem
+   sessões `idle in transaction` no `pg_stat_activity`.
+6. **Validar a correção:** comparar p95/p99 antes e depois, ver as conexões aguardando zerarem e subir primeiro num
+   canary.
+
+## ☁️ Produção
+
+- Imagem gerada no CI; em produção, seria publicada com uma tag por versão.
+- Várias réplicas em Kubernetes ou ECS, com `/actuator/health/liveness` e `readiness` como probes.
+- Configuração por variável de ambiente e segredos no gerenciador da cloud.
+- Banco gerenciado; com muitas réplicas, as migrações rodariam num job antes do deploy.
+- Dockerfile multi-stage, usuário não-root, memória da JVM ajustada ao container e health check.
+- Desligamento gracioso: o que ficar pela metade é recuperado depois.
+
+Várias instâncias já funcionam (constraint no banco e `SKIP LOCKED`). Com mais volume, separaria API e processamento
+(`PROCESSING_ENABLED`). Para avisar outros serviços, publicaria `ActivationCompleted` num tópico (Kafka, SNS/SQS)
+usando outbox, para não perder evento.
+
+## 📌 Pontos pendentes
+
+- **Timeout na última tentativa:** hoje vira `FAILED`, mas o provedor pode ter ativado. Antes de desistir, consultaria
+  o status no provedor pela `Idempotency-Key`. Se o provedor não tiver essa consulta, marcaria para reconciliação
+  manual em vez de `FAILED`.
+- **429 conta como tentativa:** um throttling longo esgota as 5 tentativas. Não contaria 429/503 com `Retry-After` no
+  limite, e usaria um prazo total (por exemplo, 24 h) para não tentar para sempre.
+- **401/403 do provedor:** hoje viram `FAILED`, mas o problema é a nossa credencial, não o pedido. Trataria como falha
+  temporária e geraria alerta, para a credencial ser corrigida antes das tentativas acabarem.
+- **Circuit breaker:** descrito em [Integração com o provedor](#integração-com-o-provedor); seria o Resilience4j em
+  volta do `ActivationProviderClient`.
+- **Credencial do provedor:** o mock não exige autenticação; armazenamento e rotação estão descritos em
+  [Segurança](#segurança).
+- **Concorrência do processamento:** o `max-concurrency` é fixo por instância. Com mais volume, ajustaria junto com o
+  pool de conexões e o limite que o provedor aceita.
+
+## 🔮 Melhorias futuras
+
+Outbox com eventos de conclusão, API e processamento separados, alertas de `FAILED` e de
+`PENDING` acumulado, limpeza de solicitações antigas.
+
+## 🤖 Uso de IA
+
+Usei um assistente de IA durante o desenvolvimento. Ele ajudou a escrever código repetitivo e testes, a montar e
+revisar a documentação e a discutir alternativas de modelagem e de tratamento de erros.
+
+Cada decisão passou por mim: avaliei as propostas, descartei várias e ajustei o que não fazia sentido para o
+problema. Além dos testes automatizados, testei a aplicação no ambiente local com `docker compose`, chamando a API e
+passando pelos cenários do provedor.
