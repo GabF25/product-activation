@@ -114,3 +114,115 @@ Para testar: crie a solicitação, acompanhe o `status` com `GET /api/v1/request
 
 Roda os testes unitários e os de integração (com PostgreSQL real via Testcontainers). O mesmo comando roda no CI, a
 cada push.
+
+## 🧠 Decisões técnicas
+
+### Estrutura
+
+Controller, service e repository, com o domínio separado da entidade JPA. O status só muda pelos métodos do domínio
+(`PENDING → PROCESSING → COMPLETED/FAILED`). Falha temporária volta para `PENDING` com a próxima tentativa agendada, e
+`PROCESSING` fica só para "chamando o provedor agora". A gravação do status usa `@Version`.
+
+### Duplicidade
+
+`UNIQUE` em (`client_id`, `external_id`), e o service tenta inserir direto. Se eu consultasse antes de inserir, duas
+requisições ao mesmo tempo passariam pela consulta e as duas inseririam.
+
+- Mesmo `externalId` e mesmo conteúdo: é retry, devolvo `201` com o registro que já existe.
+- Mesmo `externalId` com outro conteúdo: `409`.
+- Duas iguais em paralelo: as duas recebem o mesmo registro (tem teste com 10 threads no PostgreSQL).
+
+### Índices
+
+Cada índice existe por causa de uma query:
+
+| Índice | Colunas | Query que atende |
+|--------|---------|------------------|
+| `idx_activation_listing` | `client_id, customer_id, status, created_at DESC` | Listagem paginada |
+| `idx_activation_pending` | `next_attempt_at`, só linhas `PENDING` | Scheduler buscando as pendentes vencidas |
+| `idx_activation_processing` | `updated_at`, só linhas `PROCESSING` | Recuperação das solicitações presas |
+| `uk_activation_client_external_id` | `client_id, external_id` | Criação idempotente (`UNIQUE`) |
+| `uk_activation_attempt_number` | `activation_id, attempt_number` | Contagem das tentativas (`UNIQUE`) |
+
+Na listagem, `client_id` vem primeiro porque está em toda consulta (cada sistema só vê as próprias). Depois vêm
+`customer_id` e `status`, os filtros opcionais, e por último `created_at DESC`, a ordenação.
+
+| Filtros informados | Como o índice ajuda |
+|--------------------|---------------------|
+| `customerId` e `status` | Lê as linhas já na ordem da página, sem ordenar |
+| Só `customerId` | Restringe por cliente e `customer_id`; ordena o resultado |
+| Só `status`, ou nenhum | Restringe só pelo `client_id`; ordena o resultado |
+
+A ordenação sem custo só acontece com os dois filtros. Nos outros casos, o PostgreSQL ordena as linhas daquele
+cliente, o que é barato enquanto cada cliente tem poucas solicitações. Se a listagem sem filtro ficasse lenta, o próximo
+passo seria um índice `(client_id, created_at DESC)`.
+
+Os índices da fila são parciais: como quase tudo termina em `COMPLETED`, eles guardam só as linhas em andamento e
+continuam pequenos mesmo com a tabela grande.
+
+### Integração com o provedor
+
+Assíncrona: o `POST` grava `PENDING` e responde, e um scheduler chama o provedor depois.
+
+| Retorno do provedor | Novo status | Tenta de novo? | Por quê |
+|---------------------|-------------|----------------|---------|
+| 2xx | `COMPLETED` | Não | Ativado |
+| 400 e outros 4xx | `FAILED` | Não | Repetir daria o mesmo erro |
+| 500 e outros 5xx, 408 | `PENDING` | Sim, com backoff | Erro temporário |
+| 429 / 503 com `Retry-After` | `PENDING` | Sim, no tempo pedido (até 5 min) | O provedor diz quando voltar |
+| Timeout | `PENDING` | Sim, com a mesma chave de idempotência | O provedor pode ter ativado |
+
+- Até 5 tentativas, backoff começando em 5 s e dobrando até 5 min, com jitter (entre metade e o valor cheio) para as
+  solicitações que falharam juntas não voltarem todas no mesmo segundo. Depois disso, `FAILED`.
+- Cada chamada ao provedor vira uma linha em `activation_attempt`, com o número da tentativa e o erro. A tabela
+  `activation` guarda só o pedido, o status e o `next_attempt_at`, que fica nela porque é a coluna que a fila consulta.
+- Timeout de conexão de 2 s e de leitura de 5 s, configuráveis.
+- A tabela é a fila: o scheduler pega as pendentes e marca `PROCESSING` num único `UPDATE ... RETURNING` com
+  `FOR UPDATE SKIP LOCKED`, faz commit e só então chama o provedor, fora de transação. Com `SKIP LOCKED`, cada instância
+  pega linhas diferentes.
+- As chamadas rodam em paralelo, em virtual threads, limitadas por um semáforo (`max-concurrency`, 50). Cada ciclo pega
+  só a quantidade de vagas livres e não espera ninguém terminar, então uma chamada lenta ocupa só a vaga dela.
+- Se a aplicação cair no meio, a solicitação fica em `PROCESSING` e volta para `PENDING` depois de 5 min. O
+  `Idempotency-Key` (id da solicitação) evita ativar duas vezes.
+- O `Retry-After` vale em segundos ou como data HTTP, limitado a 5 min para um valor alto não estacionar a solicitação.
+
+**Circuit breaker (não implementado, mas válido).** Com o provedor fora do ar, cada solicitação pendente continua
+tentando por conta própria, até 5 vezes. O backoff com jitter espaça as chamadas, mas o serviço segue mandando tráfego
+para um provedor que já está com problema, o que pode atrasar a volta dele, e cada solicitação gasta tentativas numa
+falha que não é dela. O circuit breaker resolveria isso: depois de algumas falhas seguidas, ele para de chamar o
+provedor por um tempo, as solicitações continuam em `PENDING` sem gastar tentativas, e uma chamada de teste decide
+quando voltar. Eu usaria o Resilience4j em volta do `ActivationProviderClient`. Ficou fora para manter o escopo do
+desafio; hoje, o que limita o impacto é o `max-concurrency` e o backoff de até 5 min.
+
+### Segurança
+
+Resource server JWT: `activation:write` para criar, `activation:read` para consultar.
+
+Cada solicitação guarda o sistema que a criou (o `sub` do token). Um sistema só lista e consulta as próprias, e a de
+outro responde `404`, sem revelar que ela existe. Por isso o `externalId` é único por sistema.
+
+Corpo acima de 1 KB recebe `413`. Corpo sem `Content-Length` (enviado com `Transfer-Encoding: chunked`) recebe `411`,
+porque sem o tamanho o filtro teria que ler o corpo para medir. Cada sistema tem um limite de chamadas por minuto
+(`429` com `Retry-After`). Esse
+limite é por instância; com várias instâncias, o limite compartilhado ficaria no API Gateway.
+
+Em produção:
+
+- Fluxo Client Credentials, porque quem chama são outros sistemas.
+- Validação de assinatura (JWKS do emissor), `iss`, `aud` e `exp`, só configurando a `issuer-uri`.
+- Credencial do provedor (não implementada, porque o mock não exige autenticação):
+  - **Armazenamento:** fica num gerenciador de segredos (AWS Secrets Manager, Azure Key Vault ou HashiCorp Vault),
+    nunca no código nem no repositório. A plataforma injeta o valor numa variável de ambiente no deploy, e o
+    `ActivationProviderClient` o envia no header `Authorization` de cada chamada.
+  - **Rotação:** o gerenciador gera a credencial nova e mantém a antiga válida por um período de transição. As
+    réplicas são reiniciadas aos poucos e passam a usar a nova, sem downtime; só depois a antiga é revogada.
+  - **Credencial vencida ou revogada:** o provedor responde `401`/`403`, o que deveria gerar alerta (ver pontos
+    pendentes).
+
+O token HMAC do `dev-token.sh` só funciona no perfil local.
+
+### Estratégia de testes
+
+Unitários para domínio, mapper e cliente HTTP (contra um servidor HTTP local). Integração com PostgreSQL real via
+Testcontainers para duplicidade, concorrência e processamento, porque o H2 não se comporta igual. E um teste de ponta
+a ponta do provedor: sucesso, 400, 500 e timeout.
